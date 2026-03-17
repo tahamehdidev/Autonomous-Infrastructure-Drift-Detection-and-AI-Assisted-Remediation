@@ -1,0 +1,12 @@
+{
+  "name": "terrawatch-drift-analyzer",
+  "version": "1.0.0",
+  "description": "AI-powered drift analysis for TerraWatch",
+  "main": "scripts/analyze-drift.js",
+  "scripts": {
+    "analyze": "node scripts/analyze-drift.js"
+  },
+  "dependencies": {
+    "openai": "^4.0.0"
+  }
+}

@@ -1,0 +1,25 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+*.tfplan
+
+# Environment-specific values
+*.tfvars
+!example.tfvars
+
+# Drift detection outputs
+plan_output.txt
+drift_risk.txt
+drift_explanation.txt
+drift_pr_description.txt
+drift_slack_summary.txt
+
+# Node.js
+node_modules/
+.env
+
+# OS
+.DS_Store
+Thumbs.db

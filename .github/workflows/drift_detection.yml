@@ -1,0 +1,345 @@
+name: Terraform Drift Detection
+
+on:
+  schedule:
+    - cron: "*/10 * * * *" # Runs every 10 minutes
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+env:
+  AWS_REGION: us-east-1
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+jobs:
+  drift-detection:
+    name: Detect Drift
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Determine Environment
+        id: env-vars
+        run: |
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+          fi
+          echo "Detecting drift for: $ENVIRONMENT environment"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.0
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: |
+          terraform init -reconfigure -backend-config="backend-${{ env.ENVIRONMENT }}.hcl"
+
+      - name: Terraform Plan (Drift Detection)
+        id: plan
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -no-color -var-file="${{ env.ENVIRONMENT }}.tfvars" > plan_output.txt 2>&1
+          EXIT_CODE=$?
+          echo "exitcode=$EXIT_CODE" >> $GITHUB_OUTPUT
+          cat plan_output.txt
+          exit 0
+
+      # ── AI ANALYSIS ──────────────────────────────────────────────────
+      - name: Install Node Dependencies
+        if: steps.plan.outputs.exitcode == '2'
+        run: npm install
+
+      - name: Analyze Drift with OpenAI
+        if: steps.plan.outputs.exitcode == '2'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: node scripts/analyze-drift.js
+
+      - name: Read Risk Level
+        if: steps.plan.outputs.exitcode == '2'
+        id: risk
+        run: |
+          RISK_LEVEL=$(cat drift_risk.txt)
+          echo "level=$RISK_LEVEL" >> $GITHUB_OUTPUT
+          echo "Risk level: $RISK_LEVEL"
+
+      # ── GITHUB ISSUE ─────────────────────────────────────────────────
+      - name: Create or Update GitHub Issue
+        if: steps.plan.outputs.exitcode == '2'
+        id: issue
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const explanation = fs.readFileSync('drift_explanation.txt', 'utf8');
+            const riskLevel = fs.readFileSync('drift_risk.txt', 'utf8').trim();
+            const riskReasoning = fs.readFileSync('drift_risk_reasoning.txt', 'utf8');
+            const planOutput = fs.readFileSync('plan_output.txt', 'utf8');
+            const env = process.env.ENVIRONMENT;
+            const riskEmoji = { LOW: '🟢', MEDIUM: '🟡', HIGH: '🔴' }[riskLevel] || '⚪';
+
+            const body = `## ${riskEmoji} Terraform Drift Detected — Risk: ${riskLevel}
+
+            **Environment:** ${env}
+            **Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            ### AI Analysis
+            ${explanation}
+
+            **Risk Reasoning:** ${riskReasoning}
+
+            <details>
+            <summary>Show Terraform Plan</summary>
+
+            \`\`\`
+            ${planOutput.slice(0, 60000)}
+            \`\`\`
+
+            </details>`;
+
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'drift-detection'
+            });
+
+            const existingIssue = issues.data.find(i => i.title.includes(`[${env}]`));
+
+            if (existingIssue) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                body: `## New Drift Detected\n\n${body}`
+              });
+              core.setOutput('issue_number', existingIssue.number);
+            } else {
+              const newIssue = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `🚨 Terraform Drift Detected [${env}] — ${riskLevel} Risk`,
+                body: body,
+                labels: ['drift-detection', env, riskLevel.toLowerCase()]
+              });
+              core.setOutput('issue_number', newIssue.data.number);
+            }
+
+      # ── LOW RISK: AUTO-REMEDIATE IMMEDIATELY ─────────────────────────
+      - name: Remediate - LOW Risk Auto-Apply
+        if: steps.plan.outputs.exitcode == '2' && steps.risk.outputs.level == 'LOW'
+        id: apply-low
+        run: |
+          echo "LOW risk drift. Auto-remediating..."
+          terraform apply -auto-approve -no-color -var-file="${{ env.ENVIRONMENT }}.tfvars"
+        continue-on-error: true
+
+      - name: Close Issue - LOW Risk Remediated
+        if: steps.plan.outputs.exitcode == '2' && steps.risk.outputs.level == 'LOW' && steps.apply-low.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issueNumber = parseInt('${{ steps.issue.outputs.issue_number }}');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: '✅ LOW risk drift automatically remediated. Infrastructure is back in sync.'
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              state: 'closed'
+            });
+
+      - name: Slack - LOW Risk Fixed
+        if: steps.plan.outputs.exitcode == '2' && steps.risk.outputs.level == 'LOW' && steps.apply-low.outcome == 'success'
+        run: |
+          SUMMARY=$(cat drift_slack_summary.txt)
+          curl -X POST ${{ env.SLACK_WEBHOOK_URL }} \
+          -H 'Content-Type: application/json' \
+          -d "{
+            \"text\": \"✅ [TerraWatch] LOW risk drift auto-remediated in $ENVIRONMENT\",
+            \"attachments\": [{
+              \"color\": \"good\",
+              \"text\": \"${SUMMARY}\nEnvironment: $ENVIRONMENT | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\"
+            }]
+          }"
+
+      # ── MEDIUM RISK: AUTO-FIX DEV, BLOCK PROD ────────────────────────
+      - name: Remediate - MEDIUM Risk Auto-Apply (dev only)
+        if: steps.plan.outputs.exitcode == '2' && steps.risk.outputs.level == 'MEDIUM' && env.ENVIRONMENT == 'dev'
+        id: apply-medium
+        run: |
+          echo "MEDIUM risk drift in dev. Auto-remediating..."
+          terraform apply -auto-approve -no-color -var-file="${{ env.ENVIRONMENT }}.tfvars"
+        continue-on-error: true
+
+      - name: Close Issue - MEDIUM Risk Remediated (dev)
+        if: steps.plan.outputs.exitcode == '2' && steps.risk.outputs.level == 'MEDIUM' && env.ENVIRONMENT == 'dev' && steps.apply-medium.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issueNumber = parseInt('${{ steps.issue.outputs.issue_number }}');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: '✅ MEDIUM risk drift auto-remediated in dev environment.'
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              state: 'closed'
+            });
+
+      - name: Slack - MEDIUM Risk Fixed (dev)
+        if: steps.plan.outputs.exitcode == '2' && steps.risk.outputs.level == 'MEDIUM' && env.ENVIRONMENT == 'dev'
+        run: |
+          SUMMARY=$(cat drift_slack_summary.txt)
+          curl -X POST ${{ env.SLACK_WEBHOOK_URL }} \
+          -H 'Content-Type: application/json' \
+          -d "{
+            \"text\": \"✅ [TerraWatch] MEDIUM risk drift auto-remediated in dev\",
+            \"attachments\": [{
+              \"color\": \"good\",
+              \"text\": \"${SUMMARY}\nEnvironment: dev | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\"
+            }]
+          }"
+
+      - name: Slack - MEDIUM Risk Blocked (prod)
+        if: steps.plan.outputs.exitcode == '2' && steps.risk.outputs.level == 'MEDIUM' && env.ENVIRONMENT == 'prod'
+        run: |
+          SUMMARY=$(cat drift_slack_summary.txt)
+          curl -X POST ${{ env.SLACK_WEBHOOK_URL }} \
+          -H 'Content-Type: application/json' \
+          -d "{
+            \"text\": \"⚠️ [TerraWatch] MEDIUM risk drift in PROD — manual approval required\",
+            \"attachments\": [{
+              \"color\": \"warning\",
+              \"text\": \"${SUMMARY}\nEnvironment: prod | Auto-remediation blocked. Manual review required. <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\"
+            }]
+          }"
+
+      # ── HIGH RISK: BLOCK AUTO-APPLY, ALERT URGENTLY ──────────────────
+      - name: Slack - HIGH Risk Urgent Alert
+        if: steps.plan.outputs.exitcode == '2' && steps.risk.outputs.level == 'HIGH'
+        run: |
+          SUMMARY=$(cat drift_slack_summary.txt)
+          curl -X POST ${{ env.SLACK_WEBHOOK_URL }} \
+          -H 'Content-Type: application/json' \
+          -d "{
+            \"text\": \"🔴 [TerraWatch] HIGH RISK drift in $ENVIRONMENT — IMMEDIATE REVIEW REQUIRED\",
+            \"attachments\": [{
+              \"color\": \"danger\",
+              \"text\": \"${SUMMARY}\nEnvironment: $ENVIRONMENT | Auto-remediation BLOCKED. Human review required before any action. <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\"
+            }]
+          }"
+
+      # ── RECORD TO DRIFT HISTORY API ───────────────────────────────────
+      - name: Record Drift Event to API
+        if: steps.plan.outputs.exitcode == '2'
+        continue-on-error: true
+        run: |
+          RISK=$(cat drift_risk.txt)
+          EXPLANATION=$(cat drift_explanation.txt)
+
+          if [ "$RISK" = "HIGH" ]; then
+            STATUS="pending_review"
+          else
+            STATUS="auto_remediated"
+          fi
+
+          curl -X POST "${{ secrets.TERRAWATCH_API_URL }}/webhook/drift" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"environment\": \"$ENVIRONMENT\",
+              \"risk_level\": \"$RISK\",
+              \"explanation\": \"$EXPLANATION\",
+              \"status\": \"$STATUS\",
+              \"github_run_id\": \"${{ github.run_id }}\"
+            }"
+
+      # ── EXIT CODE 0: NO DRIFT ─────────────────────────────────────────
+      - name: Close Old Drift Issues
+        if: steps.plan.outputs.exitcode == '0'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'drift-detection'
+            });
+            for (const issue of issues.data) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: '✅ No drift detected. Infrastructure is now in sync.'
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed'
+              });
+            }
+
+      - name: No Drift Summary
+        if: steps.plan.outputs.exitcode == '0'
+        run: |
+          echo "### ✅ No Drift Detected" >> $GITHUB_STEP_SUMMARY
+          echo "Infrastructure is in sync with Terraform configuration." >> $GITHUB_STEP_SUMMARY
+
+      # ── EXIT CODE 1: PLAN FAILED ──────────────────────────────────────
+      - name: Terraform Plan Failure
+        if: steps.plan.outputs.exitcode == '1'
+        run: |
+          echo "::error::Terraform plan failed. Check logs for details."
+          cat plan_output.txt
+          exit 1
+
+      # ── FINAL DRIFT SUMMARY ───────────────────────────────────────────
+      - name: Drift Detected Summary
+        if: steps.plan.outputs.exitcode == '2'
+        run: |
+          RISK=$(cat drift_risk.txt)
+          EXPLANATION=$(cat drift_explanation.txt)
+          echo "### 🚨 Drift Detected — Risk Level: $RISK" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**AI Analysis:** $EXPLANATION" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** $ENVIRONMENT" >> $GITHUB_STEP_SUMMARY
+          if [ "$RISK" = "HIGH" ]; then
+            echo "**Action:** Auto-remediation BLOCKED. GitHub Issue opened. Urgent Slack alert sent." >> $GITHUB_STEP_SUMMARY
+          elif [ "$RISK" = "MEDIUM" ] && [ "$ENVIRONMENT" = "prod" ]; then
+            echo "**Action:** Auto-remediation BLOCKED in prod. Manual approval required." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Action:** Auto-remediation applied successfully." >> $GITHUB_STEP_SUMMARY
+          fi

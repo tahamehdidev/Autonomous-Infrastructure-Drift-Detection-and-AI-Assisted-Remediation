@@ -1,0 +1,14 @@
+{
+  "name": "terrawatch-drift-api",
+  "version": "1.0.0",
+  "description": "Drift history API for TerraWatch",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.0",
+    "pg": "^8.11.0"
+  }
+}
