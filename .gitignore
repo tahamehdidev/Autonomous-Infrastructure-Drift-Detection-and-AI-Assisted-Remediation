@@ -6,7 +6,7 @@ terraform.tfstate.backup
 *.tfplan
 
 # Environment-specific values
-*.tfvars
+*.tfvars.backup
 !example.tfvars
 
 # Drift detection outputs
