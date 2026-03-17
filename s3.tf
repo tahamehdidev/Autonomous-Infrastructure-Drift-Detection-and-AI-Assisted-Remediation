@@ -7,7 +7,7 @@ resource "aws_s3_bucket" "my_bucket" {
 
   tags = {
     Name = "app-bucket-${var.environment}"
-  }               
+  }      
 }
 
 resource "aws_s3_bucket_versioning" "my_bucket" {
