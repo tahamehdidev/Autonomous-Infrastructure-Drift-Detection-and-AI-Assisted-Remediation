@@ -13,6 +13,7 @@ permissions:
 env:
   AWS_REGION: us-east-1
   SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   drift-detection:

@@ -19,6 +19,7 @@ permissions:
 env:
   AWS_REGION: us-east-1
   TF_VERSION: "1.14.7"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   terraform-plan:
