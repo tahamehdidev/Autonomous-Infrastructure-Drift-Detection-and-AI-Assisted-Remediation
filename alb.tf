@@ -38,16 +38,30 @@ resource "aws_lb_listener" "http" {
   protocol          = "HTTP"
 
   default_action {
-    type = "redirect"
-    redirect {
-      port        = "443"
-      protocol    = "HTTPS"
-      status_code = "HTTP_301"
+    type = var.acm_certificate_arn != "" ? "redirect" : "forward"
+
+    dynamic "redirect" {
+      for_each = var.acm_certificate_arn != "" ? [1] : []
+      content {
+        port        = "443"
+        protocol    = "HTTPS"
+        status_code = "HTTP_301"
+      }
+    }
+
+    dynamic "forward" {
+      for_each = var.acm_certificate_arn == "" ? [1] : []
+      content {
+        target_group {
+          arn = aws_lb_target_group.app_tg.arn
+        }
+      }
     }
   }
 }
 
 resource "aws_lb_listener" "https" {
+  count             = var.acm_certificate_arn != "" ? 1 : 0
   load_balancer_arn = aws_lb.app_lb.arn
   port              = 443
   protocol          = "HTTPS"
